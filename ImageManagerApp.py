@@ -18,11 +18,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QGroupBox, QFormLayout, QSizePolicy, QMenu, QMenuBar,
                             QTabWidget, QListWidget, QListWidgetItem, QSplitter, 
                             QInputDialog, QHeaderView, QAbstractItemView, QDialogButtonBox,
-                            QDateTimeEdit, QStatusBar, QScrollArea, QProgressDialog, QWidget)
+                            QDateTimeEdit, QStatusBar, QScrollArea, QProgressDialog, QWidget,
+                            QSpinBox)
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "3.16.8"
+    VERSION = "3.16.9"
     BUILD_DATE = "2026-03-18"
     AUTHOR = "杜玛"
     LICENSE = "GNU Affero General Public License v3.0"
@@ -593,10 +594,14 @@ class ImageManagerWindow(QMainWindow):
         self.total_pages = 1
         self.total_images = 0
         self.current_query = None  # 保存当前搜索条件
+        self.PAGE_SIZE = 200  # 默认每页显示200张图片
     
         # 添加设置管理器
         self.settings = QSettings("ImageManager", f"ImageManagerWindow_{username}")
-        
+    
+        # 从设置中读取每页显示数量
+        self.PAGE_SIZE = int(self.settings.value("page_size", 200))
+    
         # 初始化数据库连接池
         self.db_pool = DatabasePool(self.db_path)
         
@@ -1036,6 +1041,11 @@ class ImageManagerWindow(QMainWindow):
         backup_settings_action = QAction("备份设置", self)
         backup_settings_action.triggered.connect(self.show_backup_settings_dialog)
         settings_menu.addAction(backup_settings_action)
+    
+        # 添加页面设置菜单项
+        page_settings_action = QAction("页面设置", self)
+        page_settings_action.triggered.connect(self.show_page_settings_dialog)
+        settings_menu.addAction(page_settings_action)
 
         # 帮助菜单
         help_menu = menubar.addMenu("帮助")
@@ -1047,7 +1057,57 @@ class ImageManagerWindow(QMainWindow):
         check_update_action = QAction("检查更新", self)
         check_update_action.triggered.connect(self.check_for_updates)
         help_menu.addAction(check_update_action)
-    
+
+    def show_page_settings_dialog(self):
+        """显示页面设置对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("页面设置")
+        dialog.resize(300, 150)
+        
+        layout = QVBoxLayout(dialog)
+        
+        form_layout = QFormLayout()
+        
+        # 每页显示数量输入框
+        page_size_spin = QSpinBox()
+        page_size_spin.setRange(10, 1000)
+        page_size_spin.setValue(self.PAGE_SIZE)
+        page_size_spin.setSuffix(" 张")
+        page_size_spin.setToolTip("设置每页显示的图片数量（10-1000张）")
+        
+        form_layout.addRow("每页显示数量:", page_size_spin)
+        
+        # 提示标签
+        hint_label = QLabel("提示: 数量过大会影响加载速度")
+        hint_label.setStyleSheet("color: #666; font-size: 10px;")
+        
+        layout.addLayout(form_layout)
+        layout.addWidget(hint_label)
+        
+        # 按钮
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        
+        layout.addWidget(button_box)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_page_size = page_size_spin.value()
+            if new_page_size != self.PAGE_SIZE:
+                self.PAGE_SIZE = new_page_size
+                
+                # 保存设置
+                self.settings.setValue("page_size", self.PAGE_SIZE)
+                
+                # 重置当前页到第一页
+                self.current_page = 1
+                
+                # 重新加载图片
+                self.load_images_async()
+                
+                self.show_status_message(f"每页显示数量已设置为 {self.PAGE_SIZE} 张")
+
+
     def load_categories(self):
         conn = self.db_pool.get_connection()
         cursor = conn.cursor()
@@ -1156,7 +1216,7 @@ class ImageManagerWindow(QMainWindow):
                 end_count = min(offset + len(images), self.total_images)
                 self.show_status_message(
                     f"第 {start_count}-{end_count} 张 / 共 {self.total_images} 张图片 "
-                    f"(第 {self.current_page}/{self.total_pages} 页)"
+                    f"(第 {self.current_page}/{self.total_pages} 页) - 每页 {self.PAGE_SIZE} 张"
                 )
                 
             except Exception as e:
