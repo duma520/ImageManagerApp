@@ -9,7 +9,7 @@ import queue
 from datetime import datetime
 from PySide6.QtCore import (Qt, QSize, QSettings, QDateTime, QTimer, 
                          Signal, QThread, QModelIndex, QEvent, QObject, Slot)
-from PySide6.QtGui import (QIcon, QPixmap, QKeySequence, QClipboard, 
+from PySide6.QtGui import (QIcon, QPixmap, QImage, QKeySequence, QClipboard, 
                         QGuiApplication, QPainter, QPen, 
                         QColor, QPixmapCache, QAction)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -19,12 +19,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QTabWidget, QListWidget, QListWidgetItem, QSplitter, 
                             QInputDialog, QHeaderView, QAbstractItemView, QDialogButtonBox,
                             QDateTimeEdit, QStatusBar, QScrollArea, QProgressDialog, QWidget,
-                            QSpinBox)
+                            QSpinBox, QCheckBox)
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "3.16.9"
-    BUILD_DATE = "2026-03-18"
+    VERSION = "3.18.0"
+    BUILD_DATE = "2026-08-08"
     AUTHOR = "杜玛"
     LICENSE = "GNU Affero General Public License v3.0"
     COPYRIGHT = "© 永久 杜玛"
@@ -352,7 +352,265 @@ class ImageLoadThread(QThread):
     def stop(self):
         self._is_running = False
 
-# 数据库初始化
+
+# ==================== 多线程工作类（3.18.0 新增/优化） ====================
+
+class ImageListLoadWorker(QThread):
+    """后台加载图片列表的工作线程（数据库查询+缩略图生成均在后台完成，不阻塞UI）"""
+    batch_ready = Signal(list)          # 每批结果: [(img_id, img_name, pixmap_or_None, file_path), ...]
+    count_ready = Signal(int, int)      # total_images, total_pages
+    finished_loading = Signal()         # 加载完成
+    error_occurred = Signal(str)        # 错误信息
+
+    def __init__(self, db_pool, page_size, current_page, query=None, thumb_cache_dir=None):
+        super().__init__()
+        self.db_pool = db_pool
+        self.page_size = page_size
+        self.current_page = current_page
+        self.query = query
+        self.thumb_cache_dir = thumb_cache_dir
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
+
+    def _thumb_cache_path(self, image_path, size=100):
+        """生成缩略图缓存路径（线程安全）"""
+        file_hash = hashlib.md5(image_path.encode('utf-8')).hexdigest()
+        cache_dir = self.thumb_cache_dir or os.path.join(
+            os.path.dirname(self.db_pool.db_path), "thumbs")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError:
+            pass
+        return os.path.join(cache_dir, f"{file_hash}_{size}.jpg")
+
+    def _generate_thumbnail(self, image_path, size=100):
+        """在后台线程生成缩略图（QImage 线程安全）"""
+        cache_path = self._thumb_cache_path(image_path, size)
+
+        # 优先读磁盘缓存
+        if os.path.exists(cache_path):
+            image = QImage(cache_path)
+            if not image.isNull():
+                return QPixmap.fromImage(image)
+
+        # 解码原图生成缩略图
+        image = QImage(image_path)
+        if image.isNull():
+            return None
+
+        thumb = image.scaled(size, size,
+                             Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+
+        # 写入磁盘缓存
+        try:
+            thumb.save(cache_path, "JPG", 85)
+        except Exception:
+            pass
+
+        return QPixmap.fromImage(thumb)
+
+    def run(self):
+        try:
+            conn = self.db_pool.get_connection()
+            cursor = conn.cursor()
+
+            # 统计总数
+            if self.query:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM images i "
+                    "JOIN images_fts f ON i.id = f.rowid "
+                    "WHERE images_fts MATCH ?", (self.query,))
+            else:
+                cursor.execute("SELECT COUNT(*) FROM images")
+
+            total_images = cursor.fetchone()[0]
+            total_pages = max(1, (total_images + self.page_size - 1) // self.page_size)
+            self.count_ready.emit(total_images, total_pages)
+
+            if total_images == 0:
+                self.finished_loading.emit()
+                return
+
+            offset = (self.current_page - 1) * self.page_size
+
+            # 查询当前页数据
+            if self.query:
+                cursor.execute("""
+                    SELECT i.id, i.name, i.file_path
+                    FROM images i
+                    JOIN images_fts f ON i.id = f.rowid
+                    WHERE images_fts MATCH ?
+                    ORDER BY i.id DESC
+                    LIMIT ? OFFSET ?
+                """, (self.query, self.page_size, offset))
+            else:
+                cursor.execute("""
+                    SELECT id, name, file_path
+                    FROM images
+                    ORDER BY id DESC
+                    LIMIT ? OFFSET ?
+                """, (self.page_size, offset))
+
+            images = cursor.fetchall()
+
+            # 分批生成缩略图并发送
+            batch = []
+            for img_id, img_name, img_path in images:
+                if not self._is_running:
+                    return
+
+                pixmap = None
+                if os.path.exists(img_path):
+                    pixmap = self._generate_thumbnail(img_path)
+
+                batch.append((img_id, img_name, pixmap, img_path))
+
+                if len(batch) >= 10:
+                    if not self._is_running:
+                        return
+                    self.batch_ready.emit(list(batch))
+                    batch = []
+
+            if batch and self._is_running:
+                self.batch_ready.emit(list(batch))
+
+            self.finished_loading.emit()
+
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.db_pool.close_thread_connection()
+
+
+class BackupWorker(QThread):
+    """后台备份工作线程"""
+    finished = Signal(bool, str)  # 成功标志, 备份路径或错误信息
+
+    def __init__(self, backup_manager, db_path, backup_type="manual"):
+        super().__init__()
+        self.backup_manager = backup_manager
+        self.db_path = db_path
+        self.backup_type = backup_type
+
+    def run(self):
+        try:
+            backup_path = self.backup_manager.create_backup(self.db_path, self.backup_type)
+            self.finished.emit(True, backup_path)
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+class DeleteImageWorker(QThread):
+    """后台删除图片工作线程"""
+    finished = Signal(bool, object)  # 成功标志, 结果数据
+
+    def __init__(self, db_pool, image_id):
+        super().__init__()
+        self.db_pool = db_pool
+        self.image_id = image_id
+
+    def run(self):
+        try:
+            conn = self.db_pool.get_connection()
+            cursor = conn.cursor()
+
+            # 先获取文件路径
+            cursor.execute("SELECT file_path FROM images WHERE id=?", (self.image_id,))
+            result = cursor.fetchone()
+            if not result:
+                self.finished.emit(False, "图片不存在")
+                return
+
+            file_path = result[0]
+
+            # 删除数据库记录
+            cursor.execute("DELETE FROM images WHERE id=?", (self.image_id,))
+            cursor.execute("DELETE FROM images_fts WHERE rowid=?", (self.image_id,))
+            conn.commit()
+
+            # 删除磁盘文件
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+            # 删除缩略图磁盘缓存
+            thumb_dir = os.path.join(os.path.dirname(self.db_pool.db_path), "thumbs")
+            file_hash = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+            for size in [100]:
+                cache_path = os.path.join(thumb_dir, f"{file_hash}_{size}.jpg")
+                if os.path.exists(cache_path):
+                    try:
+                        os.remove(cache_path)
+                    except OSError:
+                        pass
+
+            # 返回可用于后续刷新的数据
+            cursor.execute("SELECT COUNT(*) FROM images")
+            total_images = cursor.fetchone()[0]
+
+            self.finished.emit(True, {
+                'image_id': self.image_id,
+                'file_path': file_path,
+                'total_images': total_images
+            })
+
+        except Exception as e:
+            try:
+                conn.rollback()
+            except:
+                pass
+            self.finished.emit(False, str(e))
+        finally:
+            self.db_pool.close_thread_connection()
+
+
+class SaveInfoWorker(QThread):
+    """后台保存图片信息工作线程"""
+    finished = Signal(bool, str)  # 成功标志, 消息
+
+    def __init__(self, db_pool, image_id, name, description, category, tags):
+        super().__init__()
+        self.db_pool = db_pool
+        self.image_id = image_id
+        self.name = name
+        self.description = description
+        self.category = category
+        self.tags = tags
+
+    def run(self):
+        try:
+            conn = self.db_pool.get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                UPDATE images
+                SET name=?, description=?, category=?, tags=?, update_time=CURRENT_TIMESTAMP
+                WHERE id=?
+            ''', (self.name, self.description, self.category, self.tags, self.image_id))
+
+            # 更新全文搜索索引
+            cursor.execute("DELETE FROM images_fts WHERE rowid=?", (self.image_id,))
+            cursor.execute('''
+                INSERT INTO images_fts (rowid, name, description, category, tags)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (self.image_id, self.name, self.description, self.category, self.tags))
+
+            conn.commit()
+            self.finished.emit(True, "图片信息已保存")
+
+        except Exception as e:
+            try:
+                conn.rollback()
+            except:
+                pass
+            self.finished.emit(False, str(e))
+        finally:
+            self.db_pool.close_thread_connection()
+
+
+# ==================== 数据库初始化（原有代码） ====================
 def init_db(db_path):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -590,27 +848,36 @@ class ImageManagerWindow(QMainWindow):
         self.current_image_id = None
         self.save_thread = None
         self.load_thread = None
+        self.list_load_thread = None   # 3.18.0: 图片列表后台加载线程
+        self.backup_thread = None      # 3.18.0: 后台备份线程
+        self.delete_thread = None      # 3.18.0: 后台删除线程
+        self.save_info_thread = None   # 3.18.0: 后台保存信息线程
         self.current_page = 1
         self.total_pages = 1
         self.total_images = 0
         self.current_query = None  # 保存当前搜索条件
         self.PAGE_SIZE = 200  # 默认每页显示200张图片
+        self.last_saved_image_id = None  # 记录最后保存的图片ID，用于自动跳转
     
         # 添加设置管理器
         self.settings = QSettings("ImageManager", f"ImageManagerWindow_{username}")
     
         # 从设置中读取每页显示数量
         self.PAGE_SIZE = int(self.settings.value("page_size", 200))
+        
+        # 读取自动跳转设置（默认为False，即关闭状态）
+        # 关闭：粘贴后不跳转页数，保持当前页码，只刷新列表
+        # 开启：粘贴后自动跳转到第一页（最新图片所在页）并选中新图片
+        self.auto_jump_to_new_image = self.settings.value("auto_jump_to_new_image", False, type=bool)
     
         # 初始化数据库连接池
         self.db_pool = DatabasePool(self.db_path)
         
-        # 初始化UI
+        # 初始化UI（控件构建完成后一次性绘制）
         self.init_ui()
         
-        # 初始化数据
-        self.load_categories()
-        self.load_images_async()
+        # 3.18.0: 延迟数据加载，让窗口先完成首次绘制再加载数据，避免启动白屏卡顿
+        QTimer.singleShot(0, self._deferred_init)
         
         # 更新最后登录时间
         self.user_manager.update_last_login(username)
@@ -629,8 +896,20 @@ class ImageManagerWindow(QMainWindow):
         
         # 进度对话框
         self.progress_dialog = None
+
+    def _deferred_init(self):
+        """3.18.0: 延迟初始化 —— 窗口显示后再加载数据，避免启动卡顿"""
+        if not self.isVisible():
+            # 如果窗口还没显示（极端情况），再延迟
+            QTimer.singleShot(50, self._deferred_init)
+            return
+        self.load_categories()
+        self.load_images_async()
     
     def init_ui(self):
+        """初始化UI（3.18.0: 禁用更新避免构建时反复重绘）"""
+        self.setUpdatesEnabled(False)  # 阻止构建过程中的重复绘制
+
         self.setWindowTitle(f"{ProjectInfo.get_version_string()} - 用户: {self.username}")
         self.resize(1200, 800)
         
@@ -665,6 +944,10 @@ class ImageManagerWindow(QMainWindow):
         self.image_list.setSpacing(10)
         self.image_list.itemClicked.connect(self.on_image_selected)
         self.image_list.itemDoubleClicked.connect(self.on_image_double_clicked)
+        
+        # 为图片列表添加上下文菜单
+        self.image_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.image_list.customContextMenuRequested.connect(self.show_list_context_menu)
     
         # 设置列表部件的样式，确保背景色正确
         self.image_list.setStyleSheet("""
@@ -821,42 +1104,40 @@ class ImageManagerWindow(QMainWindow):
         # 添加一个伸缩因子在底部，确保所有内容靠上对齐
         right_layout.addStretch(0)
         
-        # 分割器
+        # 分割器 - 只添加左右两个部件
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left_widget)
-        splitter.addWidget(QWidget())
         splitter.addWidget(right_widget)
-    
+
+        # 保存分割器引用，方便后续操作
+        self.main_splitter = splitter
+
         # 读取保存的分割器大小设置
         saved_sizes = self.settings.value("splitter_sizes")
-        if saved_sizes:
-            # 确保 saved_sizes 是整数列表
-            if isinstance(saved_sizes, list):
-                try:
-                    # 将列表中的所有元素转换为整数
-                    sizes = [int(x) for x in saved_sizes]
+        if saved_sizes and isinstance(saved_sizes, list):
+            try:
+                sizes = [int(x) for x in saved_sizes]
+                # 确保只有两个值
+                if len(sizes) == 2:
                     splitter.setSizes(sizes)
-                except (ValueError, TypeError):
-                    # 转换失败时使用默认比例
+                else:
+                    # 使用默认比例
                     total_width = self.width()
                     left_width = int(total_width * 0.3)
-                    middle_width = int(total_width * 0.05)
-                    right_width = int(total_width * 0.65)
-                    splitter.setSizes([left_width, middle_width, right_width])
-            else:
-                # 如果 saved_sizes 不是列表，使用默认比例
+                    right_width = int(total_width * 0.7)
+                    splitter.setSizes([left_width, right_width])
+            except (ValueError, TypeError):
+                # 使用默认比例
                 total_width = self.width()
                 left_width = int(total_width * 0.3)
-                middle_width = int(total_width * 0.05)
-                right_width = int(total_width * 0.65)
-                splitter.setSizes([left_width, middle_width, right_width])
+                right_width = int(total_width * 0.7)
+                splitter.setSizes([left_width, right_width])
         else:
-            # 否则按窗口大小比例分配
+            # 按窗口大小比例分配
             total_width = self.width()
             left_width = int(total_width * 0.3)  # 左侧占30%
-            middle_width = int(total_width * 0.05)  # 中间占5%
-            right_width = int(total_width * 0.65)  # 右侧占65%
-            splitter.setSizes([left_width, middle_width, right_width])
+            right_width = int(total_width * 0.7)  # 右侧占70%
+            splitter.setSizes([left_width, right_width])
         
         # 连接分割器大小变化信号，保存设置
         splitter.splitterMoved.connect(self.save_splitter_sizes)
@@ -869,9 +1150,194 @@ class ImageManagerWindow(QMainWindow):
         self.paste_shortcut.triggered.connect(self.paste_image_from_clipboard)
         self.addAction(self.paste_shortcut)
 
+        self.setUpdatesEnabled(True)  # 恢复更新，一次性绘制完整UI
+
+    # ==================== 复制图片到剪贴板相关方法 ====================
+    
+    def copy_image_to_clipboard(self):
+        """复制当前选中的图片到剪贴板"""
+        if not self.current_image_id:
+            self.show_status_message("请先选择一张图片")
+            return
+        
+        conn = self.db_pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_path FROM images WHERE id=?", (self.current_image_id,))
+        result = cursor.fetchone()
+        
+        if result and os.path.exists(result[0]):
+            try:
+                # 加载图片
+                pixmap = QPixmap(result[0])
+                if not pixmap.isNull():
+                    # 复制到剪贴板
+                    clipboard = QGuiApplication.clipboard()
+                    clipboard.setPixmap(pixmap)
+                    self.show_status_message("图片已复制到剪贴板")
+                else:
+                    self.show_status_message("无法加载图片", 3000)
+            except Exception as e:
+                self.show_status_message(f"复制失败: {str(e)}", 3000)
+        else:
+            self.show_status_message("图片文件不存在", 3000)
+
+    def copy_image_to_clipboard_by_id(self, image_id):
+        """根据ID复制图片到剪贴板"""
+        conn = self.db_pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_path FROM images WHERE id=?", (image_id,))
+        result = cursor.fetchone()
+        
+        if result and os.path.exists(result[0]):
+            try:
+                pixmap = QPixmap(result[0])
+                if not pixmap.isNull():
+                    clipboard = QGuiApplication.clipboard()
+                    clipboard.setPixmap(pixmap)
+                    self.show_status_message("图片已复制到剪贴板")
+                else:
+                    self.show_status_message("无法加载图片", 3000)
+            except Exception as e:
+                self.show_status_message(f"复制失败: {str(e)}", 3000)
+        else:
+            self.show_status_message("图片文件不存在", 3000)
+
+    def show_list_context_menu(self, pos):
+        """显示图片列表的右键菜单"""
+        item = self.image_list.itemAt(pos)
+        if not item:
+            return
+        
+        img_id = item.data(Qt.ItemDataRole.UserRole)
+        if not img_id:
+            return
+        
+        menu = QMenu(self)
+        
+        copy_image_action = QAction("复制图片", self)
+        copy_image_action.triggered.connect(lambda: self.copy_image_to_clipboard_by_id(img_id))
+        menu.addAction(copy_image_action)
+        
+        menu.addSeparator()
+        
+        view_action = QAction("查看大图", self)
+        view_action.triggered.connect(lambda: self.open_image_viewer_by_id(img_id))
+        menu.addAction(view_action)
+        
+        copy_path_action = QAction("复制图片路径", self)
+        copy_path_action.triggered.connect(lambda: self.copy_image_path_to_clipboard_by_id(img_id))
+        menu.addAction(copy_path_action)
+        
+        open_folder_action = QAction("在文件夹中显示", self)
+        open_folder_action.triggered.connect(lambda: self.open_image_in_explorer_by_id(img_id))
+        menu.addAction(open_folder_action)
+        
+        menu.addSeparator()
+        
+        delete_action = QAction("删除图片", self)
+        delete_action.triggered.connect(lambda: self.delete_image_by_id(img_id))
+        menu.addAction(delete_action)
+        
+        menu.exec_(self.image_list.mapToGlobal(pos))
+
+    def open_image_viewer_by_id(self, image_id):
+        """根据ID打开图片查看器"""
+        conn = self.db_pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_path FROM images WHERE id=?", (image_id,))
+        result = cursor.fetchone()
+        
+        if result and os.path.exists(result[0]):
+            self.image_viewer = ImageViewerDialog(result[0], self, initial_size=(1200, 900))
+            self.image_viewer.show()
+
+    def copy_image_path_to_clipboard_by_id(self, image_id):
+        """根据ID复制图片路径到剪贴板"""
+        conn = self.db_pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_path FROM images WHERE id=?", (image_id,))
+        result = cursor.fetchone()
+        
+        if result:
+            clipboard = QGuiApplication.clipboard()
+            clipboard.setText(result[0])
+            self.show_status_message("图片路径已复制到剪贴板")
+
+    def open_image_in_explorer_by_id(self, image_id):
+        """根据ID在资源管理器中打开图片所在文件夹"""
+        conn = self.db_pool.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_path FROM images WHERE id=?", (image_id,))
+        result = cursor.fetchone()
+        
+        if result and os.path.exists(result[0]):
+            import platform
+            import subprocess
+            
+            file_path = result[0]
+            folder_path = os.path.dirname(file_path)
+            
+            try:
+                if platform.system() == "Windows":
+                    os.startfile(folder_path)
+                elif platform.system() == "Darwin":
+                    subprocess.Popen(["open", folder_path])
+                else:
+                    subprocess.Popen(["xdg-open", folder_path])
+            except Exception as e:
+                self.show_status_message(f"无法打开文件夹: {str(e)}", 5000)
+
+    def delete_image_by_id(self, image_id):
+        """根据ID删除图片（3.18.0: 后台线程执行）"""
+        reply = QMessageBox.question(
+            self, "确认删除", 
+            "确定要删除这张图片吗?图片文件也将被删除!", 
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+            QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # 停止之前的删除线程
+            if self.delete_thread and self.delete_thread.isRunning():
+                self.delete_thread.wait(500)
+
+            self.delete_thread = DeleteImageWorker(self.db_pool, image_id)
+
+            def on_finished(success, result):
+                if success:
+                    data = result
+                    file_path = data.get('file_path', '')
+                    if file_path:
+                        QPixmapCache.remove(f"thumb_{file_path}_100")
+
+                    total_images = data.get('total_images', 0)
+                    self.total_images = total_images
+                    self.total_pages = max(1, (total_images + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+                    if self.current_page > self.total_pages and self.current_page > 1:
+                        self.current_page = self.total_pages
+
+                    if self.current_image_id == image_id:
+                        self.current_image_id = None
+                        self.name_edit.clear()
+                        self.description_edit.clear()
+                        self.tags_edit.clear()
+                        self.category_combo.setCurrentIndex(0)
+                        self.image_label.clear()
+                        self.image_label.setText("暂无图片\n\n点击此处粘贴图片 (Ctrl+V)")
+
+                    self.load_images_async()
+                    self.load_categories()
+                    self.show_status_message("图片已删除")
+                else:
+                    self.show_status_message(f"删除失败: {result}", 5000)
+
+            self.delete_thread.finished.connect(on_finished)
+            self.delete_thread.start()
+
+    # ==================== 原有方法继续 ====================
+
     def on_search_text_changed(self, text):
         """搜索文本变化时自动搜索（带延迟）"""
-        # 可以添加延迟搜索，避免频繁查询
         pass
 
     def clear_search(self):
@@ -881,17 +1347,84 @@ class ImageManagerWindow(QMainWindow):
         self.current_page = 1
         self.load_images_async()
 
+    def get_thumb_cache_dir(self):
+        """获取缩略图磁盘缓存目录"""
+        thumb_dir = os.path.join(os.path.dirname(self.db_path), "thumbs")
+        try:
+            os.makedirs(thumb_dir, exist_ok=True)
+        except OSError:
+            pass
+        return thumb_dir
+
+    def _thumb_cache_path(self, image_path, size=100):
+        """根据图片路径生成缩略图缓存文件路径（用路径哈希，避免读文件内容）"""
+        file_hash = hashlib.md5(image_path.encode('utf-8')).hexdigest()
+        return os.path.join(self.get_thumb_cache_dir(), f"{file_hash}_{size}.jpg")
+
+    def generate_thumbnail_image(self, image_path, size=100):
+        """在任意线程生成缩略图（QImage 线程安全），命中磁盘缓存时直接读取"""
+        cache_path = self._thumb_cache_path(image_path, size)
+        
+        # 优先使用磁盘缓存
+        if os.path.exists(cache_path):
+            image = QImage(cache_path)
+            if not image.isNull():
+                return image
+        
+        # 未命中则解码原图生成
+        image = QImage(image_path)
+        if image.isNull():
+            return QImage()
+        
+        thumb = image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, 
+                            Qt.TransformationMode.SmoothTransformation)
+        
+        # 写入磁盘缓存（JPEG 体积小、解码快，适合缩略图）
+        try:
+            thumb.save(cache_path, "JPG", 85)
+        except Exception:
+            pass
+        
+        return thumb
+
+    def remove_thumb_cache(self, image_path, size=100):
+        """删除某图片的缩略图磁盘缓存"""
+        cache_path = self._thumb_cache_path(image_path, size)
+        try:
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+        except OSError:
+            pass
+
     def get_thumbnail(self, image_path, size=100):
-        """获取缩略图（使用缓存）"""
+        """获取缩略图（内存缓存 + 磁盘缓存）"""
         cache_key = f"thumb_{image_path}_{size}"
         pixmap = QPixmapCache.find(cache_key)
         
         if not pixmap or pixmap.isNull():
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
-                pixmap = pixmap.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            # 磁盘缓存命中时直接读取小图，避免解码原图
+            cache_path = self._thumb_cache_path(image_path, size)
+            if os.path.exists(cache_path):
+                pixmap = QPixmap(cache_path)
+                if not pixmap.isNull():
+                    QPixmapCache.insert(cache_key, pixmap)
+                    return pixmap
+            
+            # 未命中则解码原图生成
+            image = QImage(image_path)
+            if not image.isNull():
+                thumb = image.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, 
+                                     Qt.TransformationMode.SmoothTransformation)
+                pixmap = QPixmap.fromImage(thumb)
                 QPixmapCache.insert(cache_key, pixmap)
+                # 写磁盘缓存，供下次直接读取
+                try:
+                    thumb.save(cache_path, "JPG", 85)
+                except Exception:
+                    pass
+                return pixmap
         
+        # 内存缓存命中（find 返回有效 pixmap）时直接返回，而不是返回空
         return pixmap
 
     def on_image_clicked(self, event):
@@ -931,6 +1464,12 @@ class ImageManagerWindow(QMainWindow):
             return
         
         menu = QMenu(self)
+        
+        copy_image_action = QAction("复制图片", self)
+        copy_image_action.triggered.connect(self.copy_image_to_clipboard)
+        menu.addAction(copy_image_action)
+        
+        menu.addSeparator()
         
         view_action = QAction("查看大图", self)
         view_action.triggered.connect(lambda: self.open_image_viewer())
@@ -1047,6 +1586,31 @@ class ImageManagerWindow(QMainWindow):
         page_settings_action.triggered.connect(self.show_page_settings_dialog)
         settings_menu.addAction(page_settings_action)
 
+        # 页面菜单
+        page_menu = menubar.addMenu("页面")
+        
+        # 页面布局重置
+        reset_layout_action = QAction("页面布局重置", self)
+        reset_layout_action.triggered.connect(self.reset_page_layout)
+        page_menu.addAction(reset_layout_action)
+        
+        # 可以添加其他页面相关的功能
+        page_menu.addSeparator()
+        
+        # 左侧面板显示/隐藏
+        toggle_left_panel_action = QAction("切换左侧面板", self)
+        toggle_left_panel_action.setCheckable(True)
+        toggle_left_panel_action.setChecked(True)
+        toggle_left_panel_action.triggered.connect(lambda checked: self.toggle_panel(0, checked))
+        page_menu.addAction(toggle_left_panel_action)
+        
+        # 右侧面板显示/隐藏
+        toggle_right_panel_action = QAction("切换右侧面板", self)
+        toggle_right_panel_action.setCheckable(True)
+        toggle_right_panel_action.setChecked(True)
+        toggle_right_panel_action.triggered.connect(lambda checked: self.toggle_panel(2, checked))
+        page_menu.addAction(toggle_right_panel_action)
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助")
         
@@ -1059,10 +1623,10 @@ class ImageManagerWindow(QMainWindow):
         help_menu.addAction(check_update_action)
 
     def show_page_settings_dialog(self):
-        """显示页面设置对话框"""
+        """显示页面设置对话框（添加自动跳转开关）"""
         dialog = QDialog(self)
         dialog.setWindowTitle("页面设置")
-        dialog.resize(300, 150)
+        dialog.resize(400, 220)
         
         layout = QVBoxLayout(dialog)
         
@@ -1076,6 +1640,12 @@ class ImageManagerWindow(QMainWindow):
         page_size_spin.setToolTip("设置每页显示的图片数量（10-1000张）")
         
         form_layout.addRow("每页显示数量:", page_size_spin)
+        
+        # 添加自动跳转开关（新增功能）
+        auto_jump_checkbox = QCheckBox("粘贴后自动跳转到新图片")
+        auto_jump_checkbox.setChecked(self.auto_jump_to_new_image)
+        auto_jump_checkbox.setToolTip("开启后，粘贴图片完成时会自动跳转到第一页（最新图片所在页）并选中新图片")
+        form_layout.addRow("", auto_jump_checkbox)
         
         # 提示标签
         hint_label = QLabel("提示: 数量过大会影响加载速度")
@@ -1106,6 +1676,16 @@ class ImageManagerWindow(QMainWindow):
                 self.load_images_async()
                 
                 self.show_status_message(f"每页显示数量已设置为 {self.PAGE_SIZE} 张")
+            
+            # 保存自动跳转设置
+            new_auto_jump = auto_jump_checkbox.isChecked()
+            if new_auto_jump != self.auto_jump_to_new_image:
+                self.auto_jump_to_new_image = new_auto_jump
+                self.settings.setValue("auto_jump_to_new_image", self.auto_jump_to_new_image)
+                if self.auto_jump_to_new_image:
+                    self.show_status_message("自动跳转到新图片已开启（粘贴后将跳转到第一页并选中新图片）")
+                else:
+                    self.show_status_message("自动跳转到新图片已关闭（粘贴后保持当前页码）")
 
 
     def load_categories(self):
@@ -1118,113 +1698,121 @@ class ImageManagerWindow(QMainWindow):
         self.category_combo.addItem("")
         self.category_combo.addItems(categories)
     
-    def load_images_async(self, query=None):
-        """异步加载图片列表（分页）"""
+    def load_images_async(self, query=None, jump_to_image_id=None):
+        """异步加载图片列表（3.18.0: 使用真正后台线程，数据库查询+缩略图生成均不阻塞UI）"""
         # 保存当前查询条件
         if query is not None:
             self.current_query = query
-        
-        # 禁用更新以提高性能
+
+        # 加载代际计数：防止旧加载结果覆盖新加载
+        self._load_generation = getattr(self, "_load_generation", 0) + 1
+        my_gen = self._load_generation
+
+        # 停止之前的加载线程
+        if self.list_load_thread and self.list_load_thread.isRunning():
+            self.list_load_thread.stop()
+            self.list_load_thread.wait(500)
+
+        # 禁用更新，清空列表
         self.image_list.setUpdatesEnabled(False)
         self.image_list.clear()
-        
-        def load():
-            try:
-                conn = self.db_pool.get_connection()
-                cursor = conn.cursor()
-                
-                # 先查询总记录数
-                if self.current_query:
-                    cursor.execute("""
-                        SELECT COUNT(*) 
-                        FROM images i
-                        JOIN images_fts f ON i.id = f.rowid
-                        WHERE images_fts MATCH ?
-                    """, (self.current_query,))
-                else:
-                    cursor.execute("SELECT COUNT(*) FROM images")
-                
-                self.total_images = cursor.fetchone()[0]
-                self.total_pages = max(1, (self.total_images + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-                
-                # 确保当前页码有效
-                if self.current_page > self.total_pages:
-                    self.current_page = self.total_pages
-                
-                # 计算偏移量
-                offset = (self.current_page - 1) * self.PAGE_SIZE
-            
-                # 如果没有图片，显示提示信息
-                if self.total_images == 0:
-                    self.image_list.setUpdatesEnabled(False)
+        self.image_list.setUpdatesEnabled(True)
+
+        # 显示加载提示
+        loading_item = QListWidgetItem("正在加载图片列表...")
+        loading_item.setFlags(loading_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        loading_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_list.addItem(loading_item)
+
+        # 创建后台加载线程
+        thumb_cache_dir = os.path.join(os.path.dirname(self.db_path), "thumbs")
+        self.list_load_thread = ImageListLoadWorker(
+            self.db_pool, self.PAGE_SIZE, self.current_page,
+            query=self.current_query, thumb_cache_dir=thumb_cache_dir
+        )
+
+        # 用于暂存当前页图片ID列表（供跳转定位用）
+        self._current_page_ids = []
+
+        def on_count_ready(total_images, total_pages):
+            if my_gen != self._load_generation:
+                return
+            self.total_images = total_images
+            self.total_pages = total_pages
+            # 确保当前页码有效
+            if self.current_page > self.total_pages:
+                self.current_page = self.total_pages
+
+        def on_batch_ready(batch):
+            if my_gen != self._load_generation:
+                return
+            # 移除加载提示（首次收到数据时）
+            if self.image_list.count() == 1:
+                first_item = self.image_list.item(0)
+                if first_item and "正在加载" in (first_item.text() or ""):
                     self.image_list.clear()
-                    empty_item = QListWidgetItem("暂无图片\n\n点击右侧的「粘贴图片 (Ctrl+V)」按钮或按 Ctrl+V 添加图片")
-                    empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-                    empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    empty_item.setSizeHint(QSize(200, 100))
-                    self.image_list.addItem(empty_item)
-                    self.image_list.setUpdatesEnabled(True)
-                    
-                    # 更新分页控件状态
-                    self.update_pagination_controls()
-                    
-                    # 更新状态栏
-                    self.show_status_message("暂无图片，请添加图片")
-                    return
-                
-                # 查询当前页的数据
-                if self.current_query:
-                    cursor.execute("""
-                        SELECT i.id, i.name, i.file_path 
-                        FROM images i
-                        JOIN images_fts f ON i.id = f.rowid
-                        WHERE images_fts MATCH ?
-                        ORDER BY i.name
-                        LIMIT ? OFFSET ?
-                    """, (self.current_query, self.PAGE_SIZE, offset))
-                else:
-                    cursor.execute("""
-                        SELECT id, name, file_path 
-                        FROM images 
-                        ORDER BY name
-                        LIMIT ? OFFSET ?
-                    """, (self.PAGE_SIZE, offset))
-                
-                images = cursor.fetchall()
-                
-                # 分批添加图片项
-                for i, (img_id, img_name, img_path) in enumerate(images):
-                    if i % 10 == 0:
-                        QApplication.processEvents()
-                    
-                    item = QListWidgetItem(img_name)
-                    item.setData(Qt.ItemDataRole.UserRole, img_id)
-                    
-                    # 使用缓存缩略图
-                    if os.path.exists(img_path):
-                        pixmap = self.get_thumbnail(img_path)
-                        if pixmap and not pixmap.isNull():
-                            item.setIcon(QIcon(pixmap))
-                    
-                    self.image_list.addItem(item)
-                
-                # 更新分页控件状态
-                self.update_pagination_controls()
-                
-                # 更新状态栏
-                start_count = offset + 1 if self.total_images > 0 else 0
-                end_count = min(offset + len(images), self.total_images)
-                self.show_status_message(
-                    f"第 {start_count}-{end_count} 张 / 共 {self.total_images} 张图片 "
-                    f"(第 {self.current_page}/{self.total_pages} 页) - 每页 {self.PAGE_SIZE} 张"
-                )
-                
-            except Exception as e:
-                self.show_status_message(f"加载图片失败: {str(e)}", 5000)
-            finally:
-                self.image_list.setUpdatesEnabled(True)
-        
-        QTimer.singleShot(10, load)
+
+            for img_id, img_name, pixmap, img_path in batch:
+                self._current_page_ids.append(img_id)
+                item = QListWidgetItem(img_name)
+                item.setData(Qt.ItemDataRole.UserRole, img_id)
+                if pixmap and not pixmap.isNull():
+                    # 同时写入 QPixmapCache 供后续 get_thumbnail 命中
+                    cache_key = f"thumb_{img_path}_100"
+                    QPixmapCache.insert(cache_key, pixmap)
+                    item.setIcon(QIcon(pixmap))
+                self.image_list.addItem(item)
+
+        def on_finished():
+            if my_gen != self._load_generation:
+                return
+
+            # 移除加载提示（如果还在）
+            if self.image_list.count() == 1:
+                first_item = self.image_list.item(0)
+                if first_item and "正在加载" in (first_item.text() or ""):
+                    self.image_list.clear()
+
+            # 处理空列表
+            if self.total_images == 0 and self.image_list.count() == 0:
+                empty_item = QListWidgetItem("暂无图片\n\n点击右侧的「粘贴图片 (Ctrl+V)」按钮或按 Ctrl+V 添加图片")
+                empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                empty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                empty_item.setSizeHint(QSize(200, 100))
+                self.image_list.addItem(empty_item)
+
+            # 更新分页控件
+            self.update_pagination_controls()
+
+            # 更新状态栏
+            offset = (self.current_page - 1) * self.PAGE_SIZE
+            start_count = offset + 1 if self.total_images > 0 else 0
+            end_count = min(offset + self.image_list.count(), self.total_images)
+            self.show_status_message(
+                f"第 {start_count}-{end_count} 张 / 共 {self.total_images} 张图片 "
+                f"(第 {self.current_page}/{self.total_pages} 页) - 每页 {self.PAGE_SIZE} 张"
+            )
+
+            # 跳转到指定图片
+            if jump_to_image_id is not None and jump_to_image_id in self._current_page_ids:
+                for row in range(self.image_list.count()):
+                    item = self.image_list.item(row)
+                    if item and item.data(Qt.ItemDataRole.UserRole) == jump_to_image_id:
+                        self.image_list.setCurrentItem(item)
+                        self.image_list.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+                        self.on_image_selected(item)
+                        self.show_status_message(f"已跳转到新图片: {item.text()}")
+                        break
+
+        def on_error(error_msg):
+            if my_gen == self._load_generation:
+                self.show_status_message(f"加载图片失败: {error_msg}", 5000)
+
+        self.list_load_thread.count_ready.connect(on_count_ready)
+        self.list_load_thread.batch_ready.connect(on_batch_ready)
+        self.list_load_thread.finished_loading.connect(on_finished)
+        self.list_load_thread.error_occurred.connect(on_error)
+        self.list_load_thread.start()
     
     def update_pagination_controls(self):
         """更新分页控件状态"""
@@ -1305,6 +1893,7 @@ class ImageManagerWindow(QMainWindow):
             self.image_label.setText("无法加载图片")
     
     def save_image_info(self):
+        """保存图片信息（3.18.0: 后台线程执行，不阻塞UI）"""
         if not self.current_image_id:
             self.show_status_message("请先选择一张图片")
             return
@@ -1317,35 +1906,33 @@ class ImageManagerWindow(QMainWindow):
         description = self.description_edit.toPlainText().strip()
         category = self.category_combo.currentText().strip()
         tags = self.tags_edit.text().strip()
-        
-        conn = self.db_pool.get_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute('''
-            UPDATE images 
-            SET name=?, description=?, category=?, tags=?, update_time=CURRENT_TIMESTAMP 
-            WHERE id=?
-            ''', (name, description, category, tags, self.current_image_id))
-            
-            # 更新全文搜索索引
-            cursor.execute("DELETE FROM images_fts WHERE rowid=?", (self.current_image_id,))
-            cursor.execute('''
-            INSERT INTO images_fts (rowid, name, description, category, tags) 
-            VALUES (?, ?, ?, ?, ?)
-            ''', (self.current_image_id, name, description, category, tags))
-            
-            conn.commit()
-            
-            # 更新列表显示
-            self.load_images_async()
-            self.load_categories()
-            
-            self.show_status_message("图片信息已保存")
-        except Exception as e:
-            conn.rollback()
-            self.show_status_message(f"错误: 保存失败: {str(e)}", 5000)
+
+        # 禁用保存按钮防止重复提交
+        self.save_button.setEnabled(False)
+
+        # 停止之前的保存线程
+        if self.save_info_thread and self.save_info_thread.isRunning():
+            self.save_info_thread.wait(500)
+
+        self.save_info_thread = SaveInfoWorker(
+            self.db_pool, self.current_image_id,
+            name, description, category, tags
+        )
+
+        def on_finished(success, message):
+            self.save_button.setEnabled(True)
+            if success:
+                self.load_images_async()
+                self.load_categories()
+                self.show_status_message(message)
+            else:
+                self.show_status_message(f"保存失败: {message}", 5000)
+
+        self.save_info_thread.finished.connect(on_finished)
+        self.save_info_thread.start()
     
     def delete_image(self):
+        """删除图片（3.18.0: 后台线程执行，不阻塞UI）"""
         if not self.current_image_id:
             self.show_status_message("请先选择一张图片")
             return
@@ -1357,55 +1944,49 @@ class ImageManagerWindow(QMainWindow):
             QMessageBox.StandardButton.No)
         
         if reply == QMessageBox.StandardButton.Yes:
-            conn = self.db_pool.get_connection()
-            cursor = conn.cursor()
-            try:
-                cursor.execute("SELECT file_path FROM images WHERE id=?", (self.current_image_id,))
-                result = cursor.fetchone()
-                if not result:
-                    self.show_status_message("图片不存在")
-                    return
-                
-                file_path = result[0]
-                
-                cursor.execute("DELETE FROM images WHERE id=?", (self.current_image_id,))
-                cursor.execute("DELETE FROM images_fts WHERE rowid=?", (self.current_image_id,))
-                conn.commit()
-                
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                
-                # 清除缓存
-                QPixmapCache.remove(f"thumb_{file_path}_100")
-                
-                # 重新计算总页数
-                if self.current_query:
-                    cursor.execute("SELECT COUNT(*) FROM images i JOIN images_fts f ON i.id = f.rowid WHERE images_fts MATCH ?", (self.current_query,))
+            image_id = self.current_image_id
+
+            # 停止之前的删除线程
+            if self.delete_thread and self.delete_thread.isRunning():
+                self.delete_thread.wait(500)
+
+            self.delete_thread = DeleteImageWorker(self.db_pool, image_id)
+
+            def on_finished(success, result):
+                if success:
+                    data = result
+                    # 清除内存缓存
+                    file_path = data.get('file_path', '')
+                    if file_path:
+                        QPixmapCache.remove(f"thumb_{file_path}_100")
+
+                    # 重新计算分页
+                    total_images = data.get('total_images', 0)
+                    self.total_images = total_images
+                    self.total_pages = max(1, (total_images + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+                    # 如果当前页没数据了，切到上一页
+                    if self.current_page > self.total_pages and self.current_page > 1:
+                        self.current_page = self.total_pages
+
+                    # 如果删除的是当前选中的图片，清空详情
+                    if self.current_image_id == image_id:
+                        self.current_image_id = None
+                        self.name_edit.clear()
+                        self.description_edit.clear()
+                        self.tags_edit.clear()
+                        self.category_combo.setCurrentIndex(0)
+                        self.image_label.clear()
+                        self.image_label.setText("暂无图片\n\n点击此处粘贴图片 (Ctrl+V)")
+
+                    self.load_images_async()
+                    self.load_categories()
+                    self.show_status_message("图片已删除")
                 else:
-                    cursor.execute("SELECT COUNT(*) FROM images")
-                
-                self.total_images = cursor.fetchone()[0]
-                self.total_pages = max(1, (self.total_images + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-                
-                # 如果当前页没有数据了，切换到上一页
-                if self.current_page > self.total_pages and self.current_page > 1:
-                    self.current_page = self.total_pages
-                
-                self.current_image_id = None
-                self.name_edit.clear()
-                self.description_edit.clear()
-                self.tags_edit.clear()
-                self.category_combo.setCurrentIndex(0)
-                self.image_label.clear()
-                self.image_label.setText("暂无图片\n\n点击此处粘贴图片 (Ctrl+V)")
-                
-                self.load_images_async()
-                self.load_categories()
-                
-                self.show_status_message("图片已删除")
-            except Exception as e:
-                conn.rollback()
-                self.show_status_message(f"删除失败: {str(e)}", 5000)
+                    self.show_status_message(f"删除失败: {result}", 5000)
+
+            self.delete_thread.finished.connect(on_finished)
+            self.delete_thread.start()
     
     def paste_image_from_clipboard(self):
         """粘贴图片（完全异步处理，不阻塞UI）"""
@@ -1440,24 +2021,29 @@ class ImageManagerWindow(QMainWindow):
             self.show_status_message("剪贴板中没有可用的图片")
     
     def _process_clipboard_image(self):
-        """异步处理剪贴板图片"""
-        # 直接获取剪贴板图片（这个操作很快，不会阻塞）
-        clipboard = QGuiApplication.clipboard()
-        image = clipboard.image()
+        """异步处理剪贴板图片（解码与保存都在工作线程完成，不阻塞主线程）"""
+        def worker_func(db_pool):
+            # 在工作线程获取剪贴板图片（QImage 线程安全，大图解码不卡 UI）
+            clipboard = QGuiApplication.clipboard()
+            image = clipboard.image()
+            if image is None or image.isNull():
+                raise ValueError("无法获取剪贴板图片")
+            return self.save_clipboard_image_sync(db_pool, image)
+
+        # 停止之前的保存线程
+        if self.save_thread and self.save_thread.isRunning():
+            self.save_thread.wait(500)
         
-        if image and not image.isNull():
-            # 启动保存线程
-            self.save_thread = ImageSaveThread(self.db_pool, self.save_clipboard_image_sync, image)
-            self.save_thread.finished.connect(self.on_image_save_finished)
-            self.save_thread.start()
-        else:
-            if self.progress_dialog:
-                self.progress_dialog.close()
-                self.progress_dialog = None
-            self.show_status_message("无法获取剪贴板图片")
+        self.save_thread = ImageSaveThread(self.db_pool, worker_func)
+        self.save_thread.finished.connect(self.on_image_save_finished)
+        self.save_thread.start()
     
     def _process_local_image(self, file_path):
         """异步处理本地图片"""
+        # 停止之前的保存线程
+        if self.save_thread and self.save_thread.isRunning():
+            self.save_thread.wait(500)
+
         self.save_thread = ImageSaveThread(self.db_pool, self.save_local_image_sync, file_path)
         self.save_thread.finished.connect(self.on_image_save_finished)
         self.save_thread.start()
@@ -1469,24 +2055,35 @@ class ImageManagerWindow(QMainWindow):
             self.progress_dialog = None
         
         if success:
-            # 重新计算总页数并跳转到最后一页
+            # 重新计算总页数
             conn = self.db_pool.get_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM images")
             self.total_images = cursor.fetchone()[0]
-            self.total_pages = max(1, (self.total_images + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-            self.current_page = self.total_pages  # 跳转到最后一页
+            new_total_pages = max(1, (self.total_images + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
             
-            # 使用QTimer延迟刷新，避免阻塞
-            QTimer.singleShot(100, lambda: self._refresh_after_save())
+            # 获取新保存的图片ID（最新插入的）
+            cursor.execute("SELECT id FROM images ORDER BY id DESC LIMIT 1")
+            new_id_result = cursor.fetchone()
+            new_image_id = new_id_result[0] if new_id_result else None
+            
+            self.total_pages = new_total_pages
+            
+            # 根据自动跳转设置决定行为
+            if self.auto_jump_to_new_image and new_image_id:
+                # 开启：跳转到第一页（最新图片所在页）并选中新图片
+                if self.current_page != 1:
+                    self.current_page = 1
+                # 刷新并跳转到新图片
+                self.load_images_async(jump_to_image_id=new_image_id)
+            else:
+                # 关闭：保持当前页码，只刷新列表，不跳转
+                self.load_images_async()
+            
+            self.load_categories()
             self.show_status_message("图片已保存")
         else:
             self.show_status_message(f"保存失败: {result}", 5000)
-    
-    def _refresh_after_save(self):
-        """保存后刷新界面"""
-        self.load_images_async()
-        self.load_categories()
     
     def save_clipboard_image_sync(self, db_pool, image):
         """同步保存剪贴板图片"""
@@ -1520,10 +2117,10 @@ class ImageManagerWindow(QMainWindow):
             
             conn.commit()
             
-            # 预生成缩略图缓存
-            self.get_thumbnail(file_path)
+            # 预生成缩略图缓存（QImage 线程安全，写磁盘缓存供主线程快速读取）
+            self.generate_thumbnail_image(file_path)
             
-            return True
+            return img_id
             
         except sqlite3.Error as e:
             conn.rollback()
@@ -1563,10 +2160,10 @@ class ImageManagerWindow(QMainWindow):
                 
                 conn.commit()
                 
-                # 预生成缩略图缓存
-                self.get_thumbnail(new_file_path)
+                # 预生成缩略图缓存（QImage 线程安全，写磁盘缓存供主线程快速读取）
+                self.generate_thumbnail_image(new_file_path)
                 
-                return True
+                return img_id
                 
             except sqlite3.Error as e:
                 conn.rollback()
@@ -1586,17 +2183,36 @@ class ImageManagerWindow(QMainWindow):
         self.load_images_async()
     
     def auto_backup(self):
-        try:
-            self.backup_manager.create_backup(self.db_path, "auto")
-        except Exception as e:
-            print(f"自动备份失败: {e}")
+        """自动备份（3.18.0: 后台线程执行）"""
+        if self.backup_thread and self.backup_thread.isRunning():
+            return  # 上一次备份还在进行中，跳过
+
+        self.backup_thread = BackupWorker(self.backup_manager, self.db_path, "auto")
+
+        def on_finished(success, result):
+            if not success:
+                print(f"自动备份失败: {result}")
+
+        self.backup_thread.finished.connect(on_finished)
+        self.backup_thread.start()
     
     def manual_backup(self):
-        try:
-            backup_path = self.backup_manager.create_backup(self.db_path, "manual")
-            self.show_status_message(f"数据库已备份到: {os.path.basename(backup_path)}")
-        except Exception as e:
-            self.show_status_message(f"备份失败: {str(e)}", 5000)
+        """手动备份（3.18.0: 后台线程执行，不阻塞UI）"""
+        if self.backup_thread and self.backup_thread.isRunning():
+            self.show_status_message("备份正在进行中，请稍候...")
+            return
+
+        self.show_status_message("正在备份数据库...")
+        self.backup_thread = BackupWorker(self.backup_manager, self.db_path, "manual")
+
+        def on_finished(success, result):
+            if success:
+                self.show_status_message(f"数据库已备份到: {os.path.basename(result)}")
+            else:
+                self.show_status_message(f"备份失败: {result}", 5000)
+
+        self.backup_thread.finished.connect(on_finished)
+        self.backup_thread.start()
     
     def show_restore_dialog(self):
         dialog = RestoreDatabaseDialog(self.backup_manager, self.db_path, self)
@@ -1716,16 +2332,24 @@ class ImageManagerWindow(QMainWindow):
             self.status_message_timer.start(timeout)
     
     def closeEvent(self, event):
-        """关闭事件"""
+        """关闭事件（3.18.0: 清理所有后台线程）"""
         # 停止所有线程
-        if self.save_thread and self.save_thread.isRunning():
-            self.save_thread.quit()
-            self.save_thread.wait(1000)
-        
-        if self.load_thread and self.load_thread.isRunning():
-            self.load_thread.stop()
-            self.load_thread.wait(1000)
-        
+        threads_to_stop = [
+            ('save_thread', self.save_thread),
+            ('load_thread', self.load_thread),
+            ('list_load_thread', self.list_load_thread),
+            ('backup_thread', self.backup_thread),
+            ('delete_thread', self.delete_thread),
+            ('save_info_thread', self.save_info_thread),
+        ]
+
+        for name, thread in threads_to_stop:
+            if thread and thread.isRunning():
+                if hasattr(thread, 'stop'):
+                    thread.stop()
+                thread.quit()
+                thread.wait(1000)
+
         # 关闭所有数据库连接
         self.db_pool.close_all()
     
@@ -1806,6 +2430,55 @@ class ImageManagerWindow(QMainWindow):
             sizes = [int(x) for x in sizes]
             # 保存到设置中
             self.settings.setValue("splitter_sizes", sizes)
+
+    def reset_page_layout(self):
+        """重置页面布局为默认状态"""
+        if hasattr(self, 'main_splitter'):
+            splitter = self.main_splitter
+            # 重置分割器大小
+            total_width = self.width()
+            left_width = int(total_width * 0.3)
+            middle_width = int(total_width * 0.05)
+            right_width = int(total_width * 0.65)
+            splitter.setSizes([left_width, middle_width, right_width])
+            
+            # 清除保存的设置
+            self.settings.remove("splitter_sizes")
+            
+            # 确保所有面板可见
+            for i in range(splitter.count()):
+                widget = splitter.widget(i)
+                if widget:
+                    widget.show()
+            
+            self.show_status_message("页面布局已重置为默认状态")
+        else:
+            self.show_status_message("未找到布局分割器", 2000)
+
+    def toggle_panel(self, panel_index, visible):
+        """切换指定面板的显示/隐藏状态"""
+        splitter = self.findChild(QSplitter)
+        if splitter and panel_index < splitter.count():
+            widget = splitter.widget(panel_index)
+            if widget:
+                if visible:
+                    widget.show()
+                else:
+                    widget.hide()
+                
+                # 更新分割器大小
+                sizes = splitter.sizes()
+                if not visible:
+                    sizes[panel_index] = 0
+                else:
+                    # 如果显示，恢复到默认大小
+                    if panel_index == 0:  # 左侧面板
+                        sizes[panel_index] = int(self.width() * 0.3)
+                    elif panel_index == 1:  # 右侧面板（现在是索引1）
+                        sizes[panel_index] = int(self.width() * 0.7)
+                splitter.setSizes(sizes)
+                
+                self.show_status_message(f"面板显示状态已更新")
 
 # 数据库恢复对话框
 class RestoreDatabaseDialog(QDialog):
