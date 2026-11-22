@@ -1754,3 +1754,12 @@ viewer_settings.value("window_position")  # 窗口位置
 **文档作者**：杜玛
 
 *本文档使用 Markdown 编写，建议使用支持Markdown的编辑器查看。*
+
+## 许可
+
+本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 发布。
+
+- 完整许可证条文见仓库根目录 [LICENSE](LICENSE)。
+- 你可以自由使用、修改、分发，包括用于商业用途，无需另行获得授权。
+- 若你修改后分发，或以网络服务方式提供本软件，必须按 AGPL-3.0 公开相应源代码。
+- 本仓库自 2026-11-23 起改用 AGPL-3.0；此前已按 MIT / BSD-3-Clause 发布的版本，其接收者依原许可证获得的授权继续有效。
